@@ -5,8 +5,13 @@ The training step follows train.py: segment length 40,000, one tenth of the wind
 FocalLoss1D, and a fresh Adam optimizer on every file. A new network is started at
 each frequency-split boundary (0, 4, 10, 15) that falls inside the requested range.
 
-Example:
-    python train_validate_punet.py "D:\\Hieu\\DSC Capstone\\training" "D:\\Hieu\\DSC Capstone\\validation" 0-19
+If no file range is given, the four frequency bands are trained and scored separately
+(0-3, 4-9, 10-14, 15-19) and the reported fine/coarse scores are the average of the
+four band scores.
+
+Examples:
+    python train_validate_punet.py training validation
+    python train_validate_punet.py training validation 10-15
 """
 
 import argparse
@@ -27,9 +32,11 @@ INPUT_SIZE = 40000
 SAMPLE_SIZE = 10
 MAX_INDEX = 2_000_000_000
 CHECKPOINTS = (0, 4, 10, 15, 20)
+DEFAULT_BANDS = ((0, 3), (4, 9), (10, 14), (15, 19))
 SCORE_BASE = 5.27
 N_PER_SEC = 10_000_000
 SECONDS_PER_FILE = 200
+NOISE_FLOOR = np.finfo(np.float64).tiny
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 
@@ -183,8 +190,10 @@ def one_second_psd(path, files, channel, start):
     with h5py.File(paths[file_number], "r") as handle:
         group = handle["timeseries"]["channel0001"]
         data = handle["timeseries"][f"channel000{channel}"]["timeseries"][start_index:start_index + N_PER_SEC]
-        scaling = np.float32(group.attrs["voltage_range_mV"] / (2 * 128.0))
-        series = np.asarray(data, dtype=np.float32) * scaling
+        # float64 keeps the noise floor. In float32 the peak is so large that
+        # peak + floor rounds back to the peak, the floor becomes 0, and SNR is inf.
+        scaling = float(group.attrs["voltage_range_mV"]) / (2 * 128.0)
+        series = np.asarray(data, dtype=np.float64) * scaling
         dt = 1.0 / float(group.attrs["sampling_frequency"])
     power = dt / N_PER_SEC * (np.abs(np.fft.rfft(series)) ** 2)[1:]
     freqs = np.linspace(0, 5e6, N_PER_SEC // 2)
@@ -199,27 +208,34 @@ def signal_to_noise(freqs, power, target=0):
         center = int(np.where(freqs == target)[0][0])
     signal = np.sum(power[center - 1:center + 2])
     noise = np.sum(power[center - 50:center + 51]) - signal
-    return signal / noise, freqs[center]
+    # Guard residual underflow: a zero noise floor would make SNR infinite and
+    # then poison the weighted score with NaN.
+    if not np.isfinite(noise) or noise <= 0:
+        noise = NOISE_FLOOR
+    return float(signal / noise), freqs[center]
 
 
 def denoising_score(path, files, coarse):
     n = SECONDS_PER_FILE * len(files)
     if coarse:
         n //= 10
-    clean_snr = np.zeros(n)
-    denoised_snr = np.zeros(n)
+    clean_snr = np.zeros(n, dtype=np.float64)
+    denoised_snr = np.zeros(n, dtype=np.float64)
     for i in tqdm(range(n), desc="coarse score" if coarse else "fine score"):
         second = i * 10 if coarse else i
         freqs, clean_power = one_second_psd(path, files, 2, second)
         clean_snr[i], center = signal_to_noise(freqs, clean_power)
         _, denoised_power = one_second_psd(path, files, 1, second)
         denoised_snr[i] = signal_to_noise(freqs, denoised_power, center)[0]
-    weights = clean_snr / np.max(clean_snr)
-    raw = np.round(np.sum(weights * denoised_snr) / len(denoised_snr), decimals=2) + 1e-10
+    max_clean = np.nanmax(clean_snr)
+    if not np.isfinite(max_clean) or max_clean <= 0:
+        raise SystemExit("clean SNR is non-positive; cannot compute denoising score")
+    weights = clean_snr / max_clean
+    raw = np.round(np.nansum(weights * denoised_snr) / len(denoised_snr), decimals=2) + 1e-10
     return math.log(raw, SCORE_BASE)
 
 
-def write_report(output_dir, segment_size, sampling_frequency, n_params, fine, coarse):
+def write_report(output_dir, segment_size, sampling_frequency, n_params, fine, coarse, band_rows=None):
     report_dir = os.path.join(output_dir, "csv")
     os.makedirs(report_dir, exist_ok=True)
     path = os.path.join(report_dir, "scores.csv")
@@ -227,32 +243,71 @@ def write_report(output_dir, segment_size, sampling_frequency, n_params, fine, c
         writer = csv.writer(handle)
         writer.writerow(["Segment Size", "FS", "Parameters", "Fine Score", "Coarse Score"])
         writer.writerow([segment_size, sampling_frequency, n_params, fine, coarse])
+        if band_rows:
+            writer.writerow([])
+            writer.writerow(["Band", "Fine Score", "Coarse Score"])
+            for start, end, band_fine, band_coarse in band_rows:
+                writer.writerow([f"{start}-{end}", band_fine, band_coarse])
     log(f"wrote {path}")
     return path
+
+
+def run_range(train_dir, valid_dir, indexes, output_dir):
+    log(f"device {DEVICE} | files {indexes[0]}-{indexes[-1]} | segment {INPUT_SIZE}")
+    models, n_params, sampling_frequency = train(train_dir, indexes, output_dir)
+    written = denoise(valid_dir, indexes, models, output_dir)
+    del models
+    gc.collect()
+    if DEVICE.type == "cuda":
+        torch.cuda.empty_cache()
+
+    fine = denoising_score(output_dir, written, coarse=False)
+    coarse = denoising_score(output_dir, written, coarse=True)
+    log(f"files {indexes[0]}-{indexes[-1]} | Fine Score {fine:.6f} | Coarse Score {coarse:.6f}")
+    return n_params, sampling_frequency, fine, coarse
 
 
 def main():
     parser = argparse.ArgumentParser(description="Train, validate, and score PUNet on a file range.")
     parser.add_argument("train_dir", help="Folder of abra_training_00XX.h5 files.")
     parser.add_argument("valid_dir", help="Folder of abra_validation_00XX.h5 files.")
-    parser.add_argument("file_range", type=parse_range, help="Inclusive file numbers, for example 0-19.")
+    parser.add_argument(
+        "file_range",
+        nargs="?",
+        type=parse_range,
+        default=None,
+        help="Inclusive file numbers, for example 10-15. Omit to run bands 0-3, 4-9, 10-14, 15-19 and average scores.",
+    )
     parser.add_argument("--output_dir", "-o", default="punet_output", help="Folder for denoised files and the score csv.")
     args = parser.parse_args()
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    if args.file_range is None:
+        fine_scores = []
+        coarse_scores = []
+        band_rows = []
+        n_params = None
+        sampling_frequency = None
+        for start, end in DEFAULT_BANDS:
+            indexes = list(range(start, end + 1))
+            log(f"=== band {start}-{end} ===")
+            n_params, sampling_frequency, fine, coarse = run_range(
+                args.train_dir, args.valid_dir, indexes, args.output_dir
+            )
+            fine_scores.append(fine)
+            coarse_scores.append(coarse)
+            band_rows.append((start, end, fine, coarse))
+        fine = float(np.mean(fine_scores))
+        coarse = float(np.mean(coarse_scores))
+        write_report(args.output_dir, INPUT_SIZE, sampling_frequency, n_params, fine, coarse, band_rows)
+        log(f"Average Fine Score {fine:.6f} | Average Coarse Score {coarse:.6f}")
+        return
 
     start, end = args.file_range
     indexes = list(range(start, end + 1))
-    os.makedirs(args.output_dir, exist_ok=True)
-    log(f"device {DEVICE} | files {start}-{end} | segment {INPUT_SIZE}")
-
-    models, n_params, sampling_frequency = train(args.train_dir, indexes, args.output_dir)
-    written = denoise(args.valid_dir, indexes, models, args.output_dir)
-    del models
-    gc.collect()
-    if DEVICE.type == "cuda":
-        torch.cuda.empty_cache()
-
-    fine = denoising_score(args.output_dir, written, coarse=False)
-    coarse = denoising_score(args.output_dir, written, coarse=True)
+    n_params, sampling_frequency, fine, coarse = run_range(
+        args.train_dir, args.valid_dir, indexes, args.output_dir
+    )
     write_report(args.output_dir, INPUT_SIZE, sampling_frequency, n_params, fine, coarse)
     log(f"Fine Score {fine:.6f} | Coarse Score {coarse:.6f}")
 
