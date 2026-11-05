@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+*.h5
+*.pth
+.DS_Store
+*.egg-info/
+.venv/
+venv/
+.env
+.env.*

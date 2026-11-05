@@ -10,8 +10,14 @@ the 0..255 ADC range instead of 256 class logits, so inference rounds and clips 
 than taking an argmax. Each FCNet has ~320M parameters (~1.3 GB), so finished networks are parked
 on the CPU and moved back to the device only while they denoise their validation files.
 
-Example:
-    python train_validate_fcnet.py "D:\\Hieu\\DSC Capstone\\training" "D:\\Hieu\\DSC Capstone\\validation" 0-19
+If no file range is given, the four frequency bands are trained and scored separately
+(0-3, 4-9, 10-14, 15-19). FCNet and PUNet share seed 42 so each band draws the same
+windows. Scores are written per band as Model, Band, Segment Size, FS, Parameters,
+Fine Score, Coarse Score.
+
+Examples:
+    python train_validate_fcnet.py training validation
+    python train_validate_fcnet.py training validation 0-19
 """
 
 import argparse
@@ -19,6 +25,7 @@ import csv
 import gc
 import math
 import os
+import random
 
 import h5py
 import numpy as np
@@ -33,10 +40,15 @@ INPUT_SIZE = 40000
 SAMPLE_SIZE = 10
 MAX_INDEX = 2_000_000_000
 CHECKPOINTS = (0, 4, 10, 15, 20)
+DEFAULT_BANDS = ((0, 3), (4, 9), (10, 14), (15, 19))
+DEFAULT_SEED = 42
+MODEL_NAME = "FCNet"
+SCORE_COLUMNS = ["Model", "Band", "Segment Size", "FS", "Parameters", "Fine Score", "Coarse Score"]
 SCORE_BASE = 5.27
 N_PER_SEC = 10_000_000
 SECONDS_PER_FILE = 200
 INFER_BATCH = 25
+NOISE_FLOOR = np.finfo(np.float64).tiny
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 
@@ -57,6 +69,22 @@ def file_name(kind, index):
 
 def log(msg):
     print(msg, flush=True)
+
+
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def require_gpu():
+    if DEVICE.type != "cuda":
+        raise SystemExit("CUDA GPU is required")
+    torch.cuda.set_device(DEVICE)
+    torch.backends.cudnn.benchmark = True
+    log(f"device {DEVICE} ({torch.cuda.get_device_name(DEVICE)})")
 
 
 def free_device_memory():
@@ -216,8 +244,8 @@ def one_second_psd(path, files, channel, start):
     with h5py.File(paths[file_number], "r") as handle:
         group = handle["timeseries"]["channel0001"]
         data = handle["timeseries"][f"channel000{channel}"]["timeseries"][start_index:start_index + N_PER_SEC]
-        scaling = np.float32(group.attrs["voltage_range_mV"] / (2 * 128.0))
-        series = np.asarray(data, dtype=np.float32) * scaling
+        scaling = float(group.attrs["voltage_range_mV"]) / (2 * 128.0)
+        series = np.asarray(data, dtype=np.float64) * scaling
         dt = 1.0 / float(group.attrs["sampling_frequency"])
     power = dt / N_PER_SEC * (np.abs(np.fft.rfft(series)) ** 2)[1:]
     freqs = np.linspace(0, 5e6, N_PER_SEC // 2)
@@ -232,59 +260,111 @@ def signal_to_noise(freqs, power, target=0):
         center = int(np.where(freqs == target)[0][0])
     signal = np.sum(power[center - 1:center + 2])
     noise = np.sum(power[center - 50:center + 51]) - signal
-    return signal / noise, freqs[center]
+    if not np.isfinite(noise) or noise <= 0:
+        noise = NOISE_FLOOR
+    return float(signal / noise), freqs[center]
 
 
 def denoising_score(path, files, coarse):
     n = SECONDS_PER_FILE * len(files)
     if coarse:
         n //= 10
-    clean_snr = np.zeros(n)
-    denoised_snr = np.zeros(n)
+    clean_snr = np.zeros(n, dtype=np.float64)
+    denoised_snr = np.zeros(n, dtype=np.float64)
     for i in tqdm(range(n), desc="coarse score" if coarse else "fine score"):
         second = i * 10 if coarse else i
         freqs, clean_power = one_second_psd(path, files, 2, second)
         clean_snr[i], center = signal_to_noise(freqs, clean_power)
         _, denoised_power = one_second_psd(path, files, 1, second)
         denoised_snr[i] = signal_to_noise(freqs, denoised_power, center)[0]
-    weights = clean_snr / np.max(clean_snr)
-    raw = np.round(np.sum(weights * denoised_snr) / len(denoised_snr), decimals=2) + 1e-10
+    max_clean = np.nanmax(clean_snr)
+    if not np.isfinite(max_clean) or max_clean <= 0:
+        raise SystemExit("clean SNR is non-positive; cannot compute denoising score")
+    weights = clean_snr / max_clean
+    raw = np.round(np.nansum(weights * denoised_snr) / len(denoised_snr), decimals=2) + 1e-10
     return math.log(raw, SCORE_BASE)
 
 
-def write_report(output_dir, segment_size, sampling_frequency, n_params, fine, coarse):
-    report_dir = os.path.join(output_dir, "csv")
-    os.makedirs(report_dir, exist_ok=True)
-    path = os.path.join(report_dir, "scores.csv")
+def score_row(band, sampling_frequency, n_params, fine, coarse):
+    return [MODEL_NAME, band, INPUT_SIZE, sampling_frequency, n_params, fine, coarse]
+
+
+def write_report(path, rows):
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     with open(path, "w", newline="") as handle:
         writer = csv.writer(handle)
-        writer.writerow(["Segment Size", "FS", "Parameters", "Fine Score", "Coarse Score"])
-        writer.writerow([segment_size, sampling_frequency, n_params, fine, coarse])
+        writer.writerow(SCORE_COLUMNS)
+        writer.writerows(rows)
     log(f"wrote {path}")
     return path
+
+
+def upsert_shared_scores(path, rows):
+    existing = []
+    if os.path.exists(path):
+        with open(path, newline="") as handle:
+            reader = csv.DictReader(handle)
+            for row in reader:
+                if row.get("Model") != MODEL_NAME:
+                    existing.append([row.get(column, "") for column in SCORE_COLUMNS])
+    write_report(path, existing + rows)
+
+
+def run_range(train_dir, valid_dir, indexes, output_dir, seed):
+    set_seed(seed)
+    log(f"files {indexes[0]}-{indexes[-1]} | segment {INPUT_SIZE} | seed {seed}")
+    models, n_params, sampling_frequency = train(train_dir, indexes, output_dir)
+    written = denoise(valid_dir, indexes, models, output_dir)
+    del models
+    free_device_memory()
+
+    fine = denoising_score(output_dir, written, coarse=False)
+    coarse = denoising_score(output_dir, written, coarse=True)
+    log(f"files {indexes[0]}-{indexes[-1]} | Fine Score {fine:.6f} | Coarse Score {coarse:.6f}")
+    return n_params, sampling_frequency, fine, coarse
 
 
 def main():
     parser = argparse.ArgumentParser(description="Train, validate, and score FCNet on a file range.")
     parser.add_argument("train_dir", help="Folder of abra_training_00XX.h5 files.")
     parser.add_argument("valid_dir", help="Folder of abra_validation_00XX.h5 files.")
-    parser.add_argument("file_range", type=parse_range, help="Inclusive file numbers, for example 0-19.")
+    parser.add_argument(
+        "file_range",
+        nargs="?",
+        type=parse_range,
+        default=None,
+        help="Inclusive file numbers, for example 10-15. Omit to run bands 0-3, 4-9, 10-14, 15-19.",
+    )
     parser.add_argument("--output_dir", "-o", default="fcnet_output", help="Folder for models, denoised files, and the score csv.")
+    parser.add_argument("--seed", type=int, default=DEFAULT_SEED, help=f"RNG seed shared with PUNet (default: {DEFAULT_SEED}).")
+    parser.add_argument("--scores_csv", default="scores.csv", help="Shared scores CSV updated by both models.")
     args = parser.parse_args()
+    os.makedirs(args.output_dir, exist_ok=True)
+    require_gpu()
+    scores_path = os.path.join(args.output_dir, "csv", "scores.csv")
+
+    def save_rows(rows):
+        write_report(scores_path, rows)
+        upsert_shared_scores(args.scores_csv, rows)
+
+    if args.file_range is None:
+        rows = []
+        for start, end in DEFAULT_BANDS:
+            indexes = list(range(start, end + 1))
+            log(f"=== band {start}-{end} ===")
+            n_params, sampling_frequency, fine, coarse = run_range(
+                args.train_dir, args.valid_dir, indexes, args.output_dir, args.seed + start
+            )
+            rows.append(score_row(f"{start}-{end}", sampling_frequency, n_params, fine, coarse))
+            save_rows(rows)
+        return
 
     start, end = args.file_range
     indexes = list(range(start, end + 1))
-    os.makedirs(args.output_dir, exist_ok=True)
-    log(f"device {DEVICE} | files {start}-{end} | segment {INPUT_SIZE}")
-
-    models, n_params, sampling_frequency = train(args.train_dir, indexes, args.output_dir)
-    written = denoise(args.valid_dir, indexes, models, args.output_dir)
-    del models
-    free_device_memory()
-
-    fine = denoising_score(args.output_dir, written, coarse=False)
-    coarse = denoising_score(args.output_dir, written, coarse=True)
-    write_report(args.output_dir, INPUT_SIZE, sampling_frequency, n_params, fine, coarse)
+    n_params, sampling_frequency, fine, coarse = run_range(
+        args.train_dir, args.valid_dir, indexes, args.output_dir, args.seed + start
+    )
+    save_rows([score_row(f"{start}-{end}", sampling_frequency, n_params, fine, coarse)])
     log(f"Fine Score {fine:.6f} | Coarse Score {coarse:.6f}")
 
 

@@ -6,8 +6,9 @@ FocalLoss1D, and a fresh Adam optimizer on every file. A new network is started 
 each frequency-split boundary (0, 4, 10, 15) that falls inside the requested range.
 
 If no file range is given, the four frequency bands are trained and scored separately
-(0-3, 4-9, 10-14, 15-19) and the reported fine/coarse scores are the average of the
-four band scores.
+(0-3, 4-9, 10-14, 15-19). PUNet and FCNet share seed 42 so each band draws the same
+windows. Scores are written per band as Model, Band, Segment Size, FS, Parameters,
+Fine Score, Coarse Score.
 
 Examples:
     python train_validate_punet.py training validation
@@ -19,6 +20,7 @@ import csv
 import gc
 import math
 import os
+import random
 
 import h5py
 import numpy as np
@@ -33,6 +35,9 @@ SAMPLE_SIZE = 10
 MAX_INDEX = 2_000_000_000
 CHECKPOINTS = (0, 4, 10, 15, 20)
 DEFAULT_BANDS = ((0, 3), (4, 9), (10, 14), (15, 19))
+DEFAULT_SEED = 42
+MODEL_NAME = "PUNet"
+SCORE_COLUMNS = ["Model", "Band", "Segment Size", "FS", "Parameters", "Fine Score", "Coarse Score"]
 SCORE_BASE = 5.27
 N_PER_SEC = 10_000_000
 SECONDS_PER_FILE = 200
@@ -57,6 +62,22 @@ def file_name(kind, index):
 
 def log(msg):
     print(msg, flush=True)
+
+
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def require_gpu():
+    if DEVICE.type != "cuda":
+        raise SystemExit("CUDA GPU is required")
+    torch.cuda.set_device(DEVICE)
+    torch.backends.cudnn.benchmark = True
+    log(f"device {DEVICE} ({torch.cuda.get_device_name(DEVICE)})")
 
 
 def load_pair(path, random_index):
@@ -235,25 +256,34 @@ def denoising_score(path, files, coarse):
     return math.log(raw, SCORE_BASE)
 
 
-def write_report(output_dir, segment_size, sampling_frequency, n_params, fine, coarse, band_rows=None):
-    report_dir = os.path.join(output_dir, "csv")
-    os.makedirs(report_dir, exist_ok=True)
-    path = os.path.join(report_dir, "scores.csv")
+def score_row(band, sampling_frequency, n_params, fine, coarse):
+    return [MODEL_NAME, band, INPUT_SIZE, sampling_frequency, n_params, fine, coarse]
+
+
+def write_report(path, rows):
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     with open(path, "w", newline="") as handle:
         writer = csv.writer(handle)
-        writer.writerow(["Segment Size", "FS", "Parameters", "Fine Score", "Coarse Score"])
-        writer.writerow([segment_size, sampling_frequency, n_params, fine, coarse])
-        if band_rows:
-            writer.writerow([])
-            writer.writerow(["Band", "Fine Score", "Coarse Score"])
-            for start, end, band_fine, band_coarse in band_rows:
-                writer.writerow([f"{start}-{end}", band_fine, band_coarse])
+        writer.writerow(SCORE_COLUMNS)
+        writer.writerows(rows)
     log(f"wrote {path}")
     return path
 
 
-def run_range(train_dir, valid_dir, indexes, output_dir):
-    log(f"device {DEVICE} | files {indexes[0]}-{indexes[-1]} | segment {INPUT_SIZE}")
+def upsert_shared_scores(path, rows):
+    existing = []
+    if os.path.exists(path):
+        with open(path, newline="") as handle:
+            reader = csv.DictReader(handle)
+            for row in reader:
+                if row.get("Model") != MODEL_NAME:
+                    existing.append([row.get(column, "") for column in SCORE_COLUMNS])
+    write_report(path, existing + rows)
+
+
+def run_range(train_dir, valid_dir, indexes, output_dir, seed):
+    set_seed(seed)
+    log(f"files {indexes[0]}-{indexes[-1]} | segment {INPUT_SIZE} | seed {seed}")
     models, n_params, sampling_frequency = train(train_dir, indexes, output_dir)
     written = denoise(valid_dir, indexes, models, output_dir)
     del models
@@ -276,39 +306,38 @@ def main():
         nargs="?",
         type=parse_range,
         default=None,
-        help="Inclusive file numbers, for example 10-15. Omit to run bands 0-3, 4-9, 10-14, 15-19 and average scores.",
+        help="Inclusive file numbers, for example 10-15. Omit to run bands 0-3, 4-9, 10-14, 15-19.",
     )
     parser.add_argument("--output_dir", "-o", default="punet_output", help="Folder for denoised files and the score csv.")
+    parser.add_argument("--seed", type=int, default=DEFAULT_SEED, help=f"RNG seed shared with FCNet (default: {DEFAULT_SEED}).")
+    parser.add_argument("--scores_csv", default="scores.csv", help="Shared scores CSV updated by both models.")
     args = parser.parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
+    require_gpu()
+    scores_path = os.path.join(args.output_dir, "csv", "scores.csv")
+
+    def save_rows(rows):
+        write_report(scores_path, rows)
+        upsert_shared_scores(args.scores_csv, rows)
 
     if args.file_range is None:
-        fine_scores = []
-        coarse_scores = []
-        band_rows = []
-        n_params = None
-        sampling_frequency = None
+        rows = []
         for start, end in DEFAULT_BANDS:
             indexes = list(range(start, end + 1))
             log(f"=== band {start}-{end} ===")
             n_params, sampling_frequency, fine, coarse = run_range(
-                args.train_dir, args.valid_dir, indexes, args.output_dir
+                args.train_dir, args.valid_dir, indexes, args.output_dir, args.seed + start
             )
-            fine_scores.append(fine)
-            coarse_scores.append(coarse)
-            band_rows.append((start, end, fine, coarse))
-        fine = float(np.mean(fine_scores))
-        coarse = float(np.mean(coarse_scores))
-        write_report(args.output_dir, INPUT_SIZE, sampling_frequency, n_params, fine, coarse, band_rows)
-        log(f"Average Fine Score {fine:.6f} | Average Coarse Score {coarse:.6f}")
+            rows.append(score_row(f"{start}-{end}", sampling_frequency, n_params, fine, coarse))
+            save_rows(rows)
         return
 
     start, end = args.file_range
     indexes = list(range(start, end + 1))
     n_params, sampling_frequency, fine, coarse = run_range(
-        args.train_dir, args.valid_dir, indexes, args.output_dir
+        args.train_dir, args.valid_dir, indexes, args.output_dir, args.seed + start
     )
-    write_report(args.output_dir, INPUT_SIZE, sampling_frequency, n_params, fine, coarse)
+    save_rows([score_row(f"{start}-{end}", sampling_frequency, n_params, fine, coarse)])
     log(f"Fine Score {fine:.6f} | Coarse Score {coarse:.6f}")
 
 
